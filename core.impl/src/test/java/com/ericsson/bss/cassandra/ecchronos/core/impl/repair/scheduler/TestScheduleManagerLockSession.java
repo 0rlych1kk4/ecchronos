@@ -194,6 +194,79 @@ public class TestScheduleManagerLockSession
     }
 
     /**
+     * A failing repair task must release its lock before another task acquires
+     * the same repair resource in non-batched mode.
+     */
+    @Test
+    public void testPerTaskModeReleasesLockWhenTaskExecutionThrows() throws LockException
+    {
+        myScheduler = buildScheduler(false);
+
+        List<DummyLock> acquiredLocks = new ArrayList<>();
+        AtomicInteger executions = new AtomicInteger();
+
+        when(myLockFactory.tryLock(any(), anyString(), anyInt(), anyMap(), any()))
+                .thenAnswer(invocation ->
+                {
+                    // Detect an unreleased lock before the next acquisition.
+                    assertThat(acquiredLocks).allMatch(lock -> lock.closed);
+                    DummyLock lock = new DummyLock();
+                    acquiredLocks.add(lock);
+                    return lock;
+                });
+
+        ResourceJob job = new ResourceJob(nodeID1, 2, "dc1", "nodeA")
+        {
+            @Override
+            public Iterator<ScheduledTask> iterator()
+            {
+                Set<RepairResource> resources = Set.of(new RepairResource("dc1", "nodeA"));
+
+                ScheduledTask failingTask = new ScheduledTask()
+                {
+                    @Override
+                    public Set<RepairResource> getRepairResources()
+                    {
+                        return resources;
+                    }
+
+                    @Override
+                    public TaskExecutionResult execute(final UUID nodeID)
+                    {
+                        executions.incrementAndGet();
+                        throw new IllegalStateException("Simulated repair failure");
+                    }
+                };
+
+                ScheduledTask succeedingTask = new ScheduledTask()
+                {
+                    @Override
+                    public Set<RepairResource> getRepairResources()
+                    {
+                        return resources;
+                    }
+
+                    @Override
+                    public TaskExecutionResult execute(final UUID nodeID)
+                    {
+                        executions.incrementAndGet();
+                        return TaskExecutionResult.SUCCESS;
+                    }
+                };
+
+                return List.of(failingTask, succeedingTask).iterator();
+            }
+        };
+
+        myScheduler.schedule(nodeID1, job);
+        myScheduler.run(nodeID1);
+
+        assertThat(executions.get()).isEqualTo(2);
+        assertThat(acquiredLocks).hasSize(2);
+        assertThat(acquiredLocks).allMatch(lock -> lock.closed);
+    }
+
+    /**
      * All tasks a job currently exposes are drained within a single session (bounded by the window), without the
      * scheduler regenerating the job's repair-state snapshot between tasks. {@link CountingRefreshJob} counts how
      * many times {@link ScheduledJob#refreshState()} is invoked by the scheduler so the test can assert that an
